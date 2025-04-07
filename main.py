@@ -5,6 +5,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import os
+import config  # Import the config file for Azure credentials
+from io import BytesIO
+from azure.storage.blob import BlobServiceClient
 
 # Page config
 st.set_page_config(
@@ -89,23 +92,46 @@ def calculate_atr(df, period=14):
 
 # Available timeframe files - Reordered to have Monthly first, Weekly second, etc.
 timeframe_files = {
-    "Monthly Data (1974+)": "Gold/Gold_M_25_74.csv",
-    "Weekly Data (1974+)": "Gold/Gold_W_25_74.csv",
-    "Daily Data (1974+)": "Gold/Gold_D_25_74.csv",
-    "4-Hour Data (2008+)": "Gold/Gold_4h_25_08.csv", 
-    "1-Hour Data (2008+)": "Gold/Gold_1h_ 25_08.csv",
-    "30-Minute Data (2008+)": "Gold/Gold_ 30min_25_08.csv",
-    "15-Minute Data (2008+)": "Gold/Gold_15min_ 25_08.csv",
-    "10-Minute Data (2008+)": "Gold/Gold_10min_25_08.csv",
-    "5-Minute Data (2010+)": "Gold/Gold_5min_25_10.csv",
-    "1-Minute Data (2015+)": "Gold/Gold_1min _25_15.csv"
+    "Monthly Data (1974+)": config.timeframe_files[9],
+    "Weekly Data (1974+)": config.timeframe_files[8],
+    "Daily Data (1974+)": config.timeframe_files[7],
+    "4-Hour Data (2008+)": config.timeframe_files[6], 
+    "1-Hour Data (2008+)": config.timeframe_files[5],
+    "30-Minute Data (2008+)": config.timeframe_files[4],
+    "15-Minute Data (2008+)": config.timeframe_files[3],
+    "10-Minute Data (2008+)": config.timeframe_files[2],
+    "5-Minute Data (2010+)": config.timeframe_files[1],
+    "1-Minute Data (2015+)": config.timeframe_files[0]
 }
 
-# Function to load data from any timeframe file with improved caching
+# Initialize Azure connection
+try:
+    # Initialize the connection string
+    azure_connection_string = config.AZURE_STORAGE_CONNECTION_STRING
+    blob_service_client = BlobServiceClient.from_connection_string(azure_connection_string)
+    container_client = blob_service_client.get_container_client(config.CONTAINER_NAME)
+    st.sidebar.success("✅ Connected to Azure Blob Storage")
+except Exception as e:
+    st.sidebar.error(f"❌ Azure connection error: {str(e)}")
+    st.stop()
+
+# Function to load data from Azure Blob Storage
 @st.cache_data
-def load_data(file_path):
+def load_data(blob_name):
     try:
-        df = pd.read_csv(file_path)
+        # Get the blob client
+        blob_client = container_client.get_blob_client(blob_name)
+        
+        # Check if the blob exists
+        if not blob_client.exists():
+            st.error(f"File {blob_name} not found in Azure container.")
+            return None
+            
+        # Download the blob content
+        blob_data = blob_client.download_blob().readall()
+        
+        # Read CSV from the downloaded bytes
+        df = pd.read_csv(BytesIO(blob_data))
         
         # Convert date column
         date_col = 'Date' if 'Date' in df.columns else 'time'
@@ -137,13 +163,13 @@ def load_data(file_path):
                 
             # If we still have NaT values, try with alternative parsers
             if df['time'].isna().all():
-                st.warning(f"Initial date parsing failed for {file_path}. Trying alternative methods...")
+                st.warning(f"Initial date parsing failed for {blob_name}. Trying alternative methods...")
                 # Try with dateutil's flexible parser as last resort
-                df['time'] = pd.to_datetime(df[date_col], infer_datetime_format=True, errors='coerce')
+                df['time'] = pd.to_datetime(df[date_col], errors='coerce')
         except Exception as e:
             st.error(f"Date parsing error: {e}")
             # Final fallback - try with infer_datetime_format
-            df['time'] = pd.to_datetime(df[date_col], infer_datetime_format=True, errors='coerce')
+            df['time'] = pd.to_datetime(df[date_col], errors='coerce')
         
         # Convert price columns from strings with commas to float
         price_columns = ['Open', 'High', 'Low', 'Close', 'open', 'high', 'low', 'close']
@@ -169,74 +195,39 @@ def load_data(file_path):
         
         return df
     except Exception as e:
-        st.error(f"Error loading data: {e}")
+        st.error(f"Error loading data from Azure: {str(e)}")
         return None
 
-# New function to add the 7-level BARCODE classification system
-def add_barcode_classification(df):
-    """
-    Adds the 7-level BARCODE classification system to the dataframe:
-    1. Decennial (0-9): Which year in the decade
-    2. Presidential (1-4): Year in the presidential term
-    3. Quarter (1-4): Quarter of the year
-    4. Month (1-12): Month of the year
-    5. Week (1-4/5): Week of the month
-    6. Day (1-5): Day of the week
-    7. Session (1-3): Trading session of the day
-    """
-    # Create a copy to avoid warnings
-    df_result = df.copy()
+# Background data preloader for major timeframes
+def preload_data():
+    """Preload major timeframes in the background"""
+    # Create a placeholder for background loading progress
+    progress_placeholder = st.sidebar.empty()
     
-    # 1. Decennial classification (0-9)
-    df_result['year'] = df_result['time'].dt.year
-    df_result['decade'] = (df_result['year'] // 10) * 10
-    df_result['decennial'] = df_result['year'] % 10
-    
-    # 2. Presidential classification (1-4)
-    # Starting with 1789 as the first presidential year
-    # Presidential cycles start in year after election (traditionally)
-    df_result['presidential'] = ((df_result['year'] - 1789) % 4) + 1
-    
-    # 3. Quarter classification (1-4)
-    df_result['quarter'] = df_result['time'].dt.quarter
-    
-    # 4. Month classification (1-12)
-    df_result['month'] = df_result['time'].dt.month
-    df_result['month_name'] = df_result['time'].dt.strftime('%b')
-    
-    # 5. Week classification (1-5)
-    # We'll use ISO week of the month (1st week, 2nd week, etc.)
-    df_result['week_of_month'] = ((df_result['time'].dt.day - 1) // 7) + 1
-    df_result['week_of_year'] = df_result['time'].dt.isocalendar().week
-    
-    # 6. Day classification (1-7, where 1=Monday in ISO format)
-    df_result['day_of_week'] = df_result['time'].dt.dayofweek + 1  # Make Monday=1
-    df_result['day_name'] = df_result['time'].dt.strftime('%a')
-    
-    # 7. Session classification (1-3)
-    # Assign trading sessions based on hour
-    # 1: Asian (0-8 UTC)
-    # 2: European (8-16 UTC)
-    # 3: American (16-24 UTC)
-    hour_conditions = [
-        (df_result['time'].dt.hour >= 0) & (df_result['time'].dt.hour < 8),
-        (df_result['time'].dt.hour >= 8) & (df_result['time'].dt.hour < 16),
-        (df_result['time'].dt.hour >= 16) & (df_result['time'].dt.hour < 24)
+    # Define priority timeframes to preload
+    priority_files = [
+        config.timeframe_files[9],  # Monthly data
+        config.timeframe_files[8],  # Weekly data
+        config.timeframe_files[7],  # Daily data
     ]
-    session_values = [1, 2, 3]
-    session_names = ['Asian', 'European', 'American']
     
-    # Only add session data if we have hour information
-    if len(df_result) > 0 and hasattr(df_result['time'].iloc[0], 'hour'):
-        df_result['session'] = np.select(hour_conditions, session_values, default=0)
-        df_result['session_name'] = np.select(hour_conditions, session_names, default='Unknown')
+    # Show a message that data is loading
+    progress_placeholder.info("🔄 Loading data from Azure...")
     
-    # Add candle color classification
-    # Calculate candle color (green = bullish, red = bearish)
-    df_result['candle_color'] = np.where(df_result['Close'] >= df_result['Open'], 'green', 'red')
+    # Load each priority file
+    for i, file_path in enumerate(priority_files):
+        try:
+            load_data(file_path)
+            progress = int((i+1) / len(priority_files) * 100)
+            progress_placeholder.info(f"🔄 Loading data: {progress}% complete")
+        except Exception as e:
+            progress_placeholder.error(f"Error preloading {file_path}: {str(e)}")
     
-    # Return the improved classified dataframe
-    return df_result
+    # Clear the progress message when done
+    progress_placeholder.empty()
+
+# Preload data in background when app starts
+preload_data()
 
 # Step 1: Select timeframe file - default to Monthly data
 selected_timeframe = st.selectbox(
@@ -279,7 +270,7 @@ file_path = timeframe_files[selected_timeframe]
 timeframe_label = selected_timeframe.split()[0]  # Get the timeframe part (1-Minute, Daily, etc.)
 
 # Load the data - use progress indicator
-with st.spinner(f"Loading {timeframe_label} data..."):
+with st.spinner(f"Loading {timeframe_label} data from Azure..."):
     df = load_data(file_path)
 
 if df is not None:
@@ -1256,7 +1247,7 @@ if True:
         1. **Decennial (0-9)**: Position in decade (0=year ending in 0, 9=year ending in 9)
         2. **Presidential (1-4)**: Year in presidential term (1=first year, 4=fourth year)
         3. **Quarter (1-4)**: Quarter of year (1=Q1, 4=Q4)
-        4. **Month (1-12)**: Month of year (1=Jan, 12=Dec)
+        4. **Month (1-12)**: Month of the year (1=Jan, 12=Dec)
         5. **Week (1-5)**: Week of month (1=first week, 5=fifth week if exists)
         6. **Day (1-7)**: Day of week (1=Monday, 7=Sunday)
         7. **Session (1-3)**: Trading session (1=Asian, 2=European, 3=American)
@@ -2175,3 +2166,69 @@ with st.expander(" Understand ATR (Average True Range) Analysis"):
     **3. Volatility Comparison**
     - Current vs. Average: {volatility_comparison if avg_atr_pct > 0 else "N/A (insufficient data)"}
     """)
+
+# New function to add the 7-level BARCODE classification system
+def add_barcode_classification(df):
+    """
+    Adds the 7-level BARCODE classification system to the dataframe:
+    1. Decennial (0-9): Which year in the decade
+    2. Presidential (1-4): Year in the presidential term
+    3. Quarter (1-4): Quarter of the year
+    4. Month (1-12): Month of the year
+    5. Week (1-4/5): Week of the month
+    6. Day (1-5): Day of the week
+    7. Session (1-3): Trading session of the day
+    """
+    # Create a copy to avoid warnings
+    df_result = df.copy()
+    
+    # 1. Decennial classification (0-9)
+    df_result['year'] = df_result['time'].dt.year
+    df_result['decade'] = (df_result['year'] // 10) * 10
+    df_result['decennial'] = df_result['year'] % 10
+    
+    # 2. Presidential classification (1-4)
+    # Starting with 1789 as the first presidential year
+    # Presidential cycles start in year after election (traditionally)
+    df_result['presidential'] = ((df_result['year'] - 1789) % 4) + 1
+    
+    # 3. Quarter classification (1-4)
+    df_result['quarter'] = df_result['time'].dt.quarter
+    
+    # 4. Month classification (1-12)
+    df_result['month'] = df_result['time'].dt.month
+    df_result['month_name'] = df_result['time'].dt.strftime('%b')
+    
+    # 5. Week classification (1-5)
+    # We'll use ISO week of the month (1st week, 2nd week, etc.)
+    df_result['week_of_month'] = ((df_result['time'].dt.day - 1) // 7) + 1
+    df_result['week_of_year'] = df_result['time'].dt.isocalendar().week
+    
+    # 6. Day classification (1-7, where 1=Monday in ISO format)
+    df_result['day_of_week'] = df_result['time'].dt.dayofweek + 1  # Make Monday=1
+    df_result['day_name'] = df_result['time'].dt.strftime('%a')
+    
+    # 7. Session classification (1-3)
+    # Assign trading sessions based on hour
+    # 1: Asian (0-8 UTC)
+    # 2: European (8-16 UTC)
+    # 3: American (16-24 UTC)
+    hour_conditions = [
+        (df_result['time'].dt.hour >= 0) & (df_result['time'].dt.hour < 8),
+        (df_result['time'].dt.hour >= 8) & (df_result['time'].dt.hour < 16),
+        (df_result['time'].dt.hour >= 16) & (df_result['time'].dt.hour < 24)
+    ]
+    session_values = [1, 2, 3]
+    session_names = ['Asian', 'European', 'American']
+    
+    # Only add session data if we have hour information
+    if len(df_result) > 0 and hasattr(df_result['time'].iloc[0], 'hour'):
+        df_result['session'] = np.select(hour_conditions, session_values, default=0)
+        df_result['session_name'] = np.select(hour_conditions, session_names, default='Unknown')
+    
+    # Add candle color classification
+    # Calculate candle color (green = bullish, red = bearish)
+    df_result['candle_color'] = np.where(df_result['Close'] >= df_result['Open'], 'green', 'red')
+    
+    # Return the improved classified dataframe
+    return df_result
