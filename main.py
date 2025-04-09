@@ -5,19 +5,29 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import os
-import config  # Import the config file for Azure credentials
-from io import BytesIO
 from azure.storage.blob import BlobServiceClient
+from config import AZURE_STORAGE_CONNECTION_STRING, CONTAINER_NAME
 
 # Page config
 st.set_page_config(
     page_title="Gold Timeframe Analysis",
-    page_icon="",
+    page_icon="🪙",
     layout="wide"
 )
 
 # Title with clear explanation
-st.title(" Gold Price Analysis - All Timeframes")
+st.title("🪙 Gold Price Analysis - All Timeframes")
+
+# Check Azure connection
+try:
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+    container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+    # Try to list blobs to verify connection
+    next(container_client.list_blobs(), None)
+    st.success("✅ Successfully connected to Azure Storage")
+except Exception as e:
+    st.error(f"❌ Failed to connect to Azure Storage: {str(e)}")
+
 st.markdown("""
 This tool lets you analyze gold prices across different timeframes.
 First, select which timeframe file you want to use from the dropdown menu.
@@ -90,86 +100,92 @@ def calculate_atr(df, period=14):
     
     return df_copy
 
-# Available timeframe files - Reordered to have Monthly first, Weekly second, etc.
-timeframe_files = {
-    "Monthly Data (1974+)": config.timeframe_files[9],
-    "Weekly Data (1974+)": config.timeframe_files[8],
-    "Daily Data (1974+)": config.timeframe_files[7],
-    "4-Hour Data (2008+)": config.timeframe_files[6], 
-    "1-Hour Data (2008+)": config.timeframe_files[5],
-    "30-Minute Data (2008+)": config.timeframe_files[4],
-    "15-Minute Data (2008+)": config.timeframe_files[3],
-    "10-Minute Data (2008+)": config.timeframe_files[2],
-    "5-Minute Data (2010+)": config.timeframe_files[1],
-    "1-Minute Data (2015+)": config.timeframe_files[0]
-}
+# New function to add the 7-level BARCODE classification system
+def add_barcode_classification(df):
+    """
+    Adds the 7-level BARCODE classification system to the dataframe:
+    1. Decennial (0-9): Which year in the decade
+    2. Presidential (1-4): Year in the presidential term
+    3. Quarter (1-4): Quarter of the year
+    4. Month (1-12): Month of the year
+    5. Week (1-4/5): Week of the month
+    6. Day (1-5): Day of the week
+    7. Session (1-3): Trading session of the day
+    """
+    # 1. Decennial classification (0-9)
+    df['year'] = df['time'].dt.year
+    df['decade'] = (df['year'] // 10) * 10
+    df['decennial'] = df['year'] % 10
+    
+    # 2. Presidential classification (1-4)
+    # Starting with 1789 as the first presidential year
+    # Presidential cycles start in year after election (traditionally)
+    df['presidential'] = ((df['year'] - 1789) % 4) + 1
+    
+    # 3. Quarter classification (1-4)
+    df['quarter'] = df['time'].dt.quarter
+    
+    # 4. Month classification (1-12)
+    df['month'] = df['time'].dt.month
+    df['month_name'] = df['time'].dt.strftime('%b')
+    
+    # 5. Week classification (1-5)
+    # Week of month (1-5)
+    df['day_of_month'] = df['time'].dt.day
+    df['week_of_month'] = ((df['day_of_month'] - 1) // 7) + 1
+    
+    # 6. Day classification (1-5 for Monday-Friday)
+    # 0=Monday, 6=Sunday in pandas, so we adjust to 1-7
+    df['day_of_week'] = df['time'].dt.dayofweek + 1
+    df['day_name'] = df['time'].dt.strftime('%a')
+    
+    # 7. Session classification (1-3)
+    # For intraday data only
+    if 'time' in df.columns and df['time'].dt.hour.nunique() > 1:
+        # Define trading sessions based on hour of day (UTC)
+        df['hour'] = df['time'].dt.hour
+        # Session 1: Asian (00:00-08:00 UTC)
+        # Session 2: European (08:00-16:00 UTC)
+        # Session 3: American (16:00-24:00 UTC)
+        conditions = [
+            (df['hour'] >= 0) & (df['hour'] < 8),
+            (df['hour'] >= 8) & (df['hour'] < 16),
+            (df['hour'] >= 16) & (df['hour'] <= 23)
+        ]
+        choices = [1, 2, 3]
+        df['session'] = np.select(conditions, choices, default=0)
+        
+        # Add session names for readability
+        session_map = {1: 'Asian', 2: 'European', 3: 'American', 0: 'Unknown'}
+        df['session_name'] = df['session'].map(session_map)
+    
+    return df
 
-# Initialize Azure connection
-try:
-    # Initialize the connection string
-    azure_connection_string = config.AZURE_STORAGE_CONNECTION_STRING
-    blob_service_client = BlobServiceClient.from_connection_string(azure_connection_string)
-    container_client = blob_service_client.get_container_client(config.CONTAINER_NAME)
-    st.sidebar.success("✅ Connected to Azure Blob Storage")
-except Exception as e:
-    st.sidebar.error(f"❌ Azure connection error: {str(e)}")
-    st.stop()
-
-# Function to load data from Azure Blob Storage
+# Function to load data from any timeframe file
 @st.cache_data
-def load_data(blob_name):
+def load_data(file_path):
+    """Load data from Azure Blob Storage."""
     try:
-        # Get the blob client
-        blob_client = container_client.get_blob_client(blob_name)
+        # Create a blob service client
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
         
-        # Check if the blob exists
-        if not blob_client.exists():
-            st.error(f"File {blob_name} not found in Azure container.")
-            return None
-            
+        # Get a container client
+        container_client = blob_service_client.get_container_client(CONTAINER_NAME)
+        
+        # Get a blob client
+        blob_client = container_client.get_blob_client(file_path)
+        
         # Download the blob content
-        blob_data = blob_client.download_blob().readall()
+        download_stream = blob_client.download_blob()
         
-        # Read CSV from the downloaded bytes
-        df = pd.read_csv(BytesIO(blob_data))
+        # Read the CSV data directly from the stream
+        df = pd.read_csv(download_stream)
         
         # Convert date column
         date_col = 'Date' if 'Date' in df.columns else 'time'
         
-        # Check a sample date format to determine how to parse
-        sample_date = df[date_col].iloc[0] if len(df) > 0 else ""
-        sample_date_str = str(sample_date)
-        
-        # Check if date contains time information
-        contains_time = ":" in sample_date_str or "AM" in sample_date_str or "PM" in sample_date_str
-        
-        try:
-            if '/' in sample_date_str and contains_time:
-                # Format like MM/DD/YYYY HH:MM AM/PM
-                if "AM" in sample_date_str or "PM" in sample_date_str:
-                    df['time'] = pd.to_datetime(df[date_col], format='%m/%d/%Y %I:%M %p', errors='coerce')
-                else:
-                    # Format like MM/DD/YYYY HH:MM:SS
-                    df['time'] = pd.to_datetime(df[date_col], format='%m/%d/%Y %H:%M:%S', errors='coerce')
-            elif '/' in sample_date_str:
-                # Format like MM/DD/YYYY
-                df['time'] = pd.to_datetime(df[date_col], format='%m/%d/%Y', errors='coerce')
-            elif '-' in sample_date_str:
-                # Format like YYYY-MM-DD
-                df['time'] = pd.to_datetime(df[date_col], format='%Y-%m-%d', errors='coerce')
-            else:
-                # Fallback to default parser
-                df['time'] = pd.to_datetime(df[date_col], errors='coerce')
-                
-            # If we still have NaT values, try with alternative parsers
-            if df['time'].isna().all():
-                st.warning(f"Initial date parsing failed for {blob_name}. Trying alternative methods...")
-                # Try with dateutil's flexible parser as last resort
-                df['time'] = pd.to_datetime(df[date_col], errors='coerce')
-        except Exception as e:
-            st.error(f"Date parsing error: {e}")
-            # Final fallback - try with infer_datetime_format
-            df['time'] = pd.to_datetime(df[date_col], errors='coerce')
+        # Convert to datetime
+        df['time'] = pd.to_datetime(df[date_col], errors='coerce')
         
         # Convert price columns from strings with commas to float
         price_columns = ['Open', 'High', 'Low', 'Close', 'open', 'high', 'low', 'close']
@@ -186,55 +202,41 @@ def load_data(blob_name):
             df['Low'] = df['low']
         if 'close' in df.columns and 'Close' not in df.columns:
             df['Close'] = df['close']
-            
-        # Sort by date (oldest first to ensure correct calculations)
+        
+        # Sort by time to ensure data is in chronological order
         df = df.sort_values('time')
         
         # Add BARCODE classification levels
         df = add_barcode_classification(df)
         
         return df
+        
     except Exception as e:
-        st.error(f"Error loading data from Azure: {str(e)}")
+        st.error(f"Error loading data: {str(e)}")
         return None
 
-# Background data preloader for major timeframes
-def preload_data():
-    """Preload major timeframes in the background"""
-    # Create a placeholder for background loading progress
-    progress_placeholder = st.sidebar.empty()
-    
-    # Define priority timeframes to preload
-    priority_files = [
-        config.timeframe_files[9],  # Monthly data
-        config.timeframe_files[8],  # Weekly data
-        config.timeframe_files[7],  # Daily data
-    ]
-    
-    # Show a message that data is loading
-    progress_placeholder.info("🔄 Loading data from Azure...")
-    
-    # Load each priority file
-    for i, file_path in enumerate(priority_files):
-        try:
-            load_data(file_path)
-            progress = int((i+1) / len(priority_files) * 100)
-            progress_placeholder.info(f"🔄 Loading data: {progress}% complete")
-        except Exception as e:
-            progress_placeholder.error(f"Error preloading {file_path}: {str(e)}")
-    
-    # Clear the progress message when done
-    progress_placeholder.empty()
+# Available timeframe files
+timeframe_files = {
+    "Monthly Data (1974+)": "Gold_M_25_74.csv",
+    "Weekly Data (1974+)": "Gold_W_25_74.csv",
+    "Daily Data (1974+)": "Gold_D_25_74.csv",
+    "4-Hour Data (2008+)": "Gold_4h_25_08.csv",
+    "1-Hour Data (2008+)": "Gold_1h_25_08.csv",
+    "30-Minute Data (2008+)": "Gold_30min_25_08.csv",
+    "15-Minute Data (2008+)": "Gold_15min_25_08.csv",
+    "10-Minute Data (2008+)": "Gold_10min_25_08.csv",
+    "5-Minute Data (2010+)": "Gold_5min_25_10.csv",
+    "1-Minute Data (2015+)": "Gold_1min_25_15.csv"
+}
 
-# Preload data in background when app starts
-preload_data()
-
-# Step 1: Select timeframe file - default to Monthly data
+# Step 1: Select timeframe file
 selected_timeframe = st.selectbox(
     "Step 1: Select which timeframe to analyze:",
-    options=list(timeframe_files.keys()),
-    index=0  # Default to first item (Monthly)
+    options=list(timeframe_files.keys())
 )
+
+file_path = timeframe_files[selected_timeframe]
+timeframe_label = selected_timeframe.split()[0]  # Get the timeframe part (1-Minute, Daily, etc.)
 
 # Sidebar for ATR settings
 st.sidebar.header("Analysis Settings")
@@ -242,7 +244,6 @@ atr_period = st.sidebar.slider("ATR Period", min_value=1, max_value=50, value=14
                               help="Number of periods used to calculate ATR")
 show_atr_pct = st.sidebar.checkbox("Show ATR as % of Price", value=True, 
                                   help="Display ATR as a percentage of price instead of absolute value")
-
 
 # Add time window selection for seasonal analysis
 st.sidebar.header("Seasonal Analysis Settings")
@@ -266,20 +267,16 @@ st.sidebar.header("ATR Analysis Settings")
 atr_ratio_enabled = st.sidebar.checkbox("Enable ATR Points System (1-2-3 Scale)", value=True,
                                       help="Categorize ATR values on a 1-2-3 scale for easy pattern recognition")
 
-file_path = timeframe_files[selected_timeframe]
-timeframe_label = selected_timeframe.split()[0]  # Get the timeframe part (1-Minute, Daily, etc.)
-
-# Load the data - use progress indicator
-with st.spinner(f"Loading {timeframe_label} data from Azure..."):
-    df = load_data(file_path)
+# Load the data
+df = load_data(file_path)
 
 if df is not None:
     # Display file information
-    st.success(f"Loaded {len(df):,} rows from {file_path}")
-    st.info(f"Data ranges from {df['time'].min().date()} to {df['time'].max().date()}")
+    st.success(f"✅ Loaded {len(df):,} rows from {file_path}")
+    st.info(f"📅 Data ranges from {df['time'].min().date()} to {df['time'].max().date()}")
     
     # Display the raw data sample
-    with st.expander(f"See raw {selected_timeframe} data sample (first 5 rows)"):
+    with st.expander(f"👀 See raw {timeframe_label} data sample (first 5 rows)"):
         st.dataframe(df.head())
         
         # Show column descriptions
@@ -351,9 +348,9 @@ if df is not None:
     
     # Check if we have data for the selected period
     if filtered_df.empty:
-        st.warning(f"No data available for the selected time period. Try a different selection.")
+        st.warning(f"⚠️ No data available for the selected time period. Try a different selection.")
     else:
-        st.success(f"Found {len(filtered_df):,} {selected_timeframe} data points from {filtered_df['time'].min().date()} to {filtered_df['time'].max().date()}")
+        st.success(f"✅ Found {len(filtered_df):,} {timeframe_label} data points from {filtered_df['time'].min().date()} to {filtered_df['time'].max().date()}")
         
         # Calculate ATR
         filtered_df = calculate_atr(filtered_df, period=atr_period)
@@ -389,12 +386,17 @@ if df is not None:
             st.metric("Green Candles", f"{green_pct:.1f}%", 
                      f"{green_candles} of {total_candles} candles")
         with col3:
-            st.metric(f"Current ATR ({atr_period})", f"${current_atr:.2f}", 
-                     "Absolute Value")
-            st.info(f"This means price typically moves ±${current_atr:.2f} over {atr_period} periods")
+            if show_atr_pct:
+                st.metric(f"Current ATR ({atr_period})", f"{current_atr_pct:.2f}%", 
+                        "% of Price")
+                st.info(f"This means price typically moves ±{current_atr_pct:.2f}% over {atr_period} periods")
+            else:
+                st.metric(f"Current ATR ({atr_period})", f"${current_atr:.2f}", 
+                        "Absolute Value")
+                st.info(f"This means price typically moves ±${current_atr:.2f} over {atr_period} periods")
         
         # Step 4: Display price chart with ATR
-        st.subheader(f"Step 4: {selected_timeframe} Price Chart with ATR")
+        st.subheader(f"Step 4: {timeframe_label} Price Chart with ATR")
         
         # Create tabs for different chart views
         chart_tab1, chart_tab2 = st.tabs(["Price Chart", "ATR Chart"])
@@ -446,7 +448,7 @@ if df is not None:
                 
                 # Update layout for both subplots
                 fig.update_layout(
-                    title=f"Gold Price - {selected_timeframe} Chart (TradingView Style)",
+                    title=f"Gold Price - {timeframe_label} Chart (TradingView Style)",
                     xaxis_title="",
                     yaxis_title="Price (USD)",
                     height=700,
@@ -538,7 +540,7 @@ if df is not None:
                 
                 # Update layout
                 fig.update_layout(
-                    title=f"Gold Price - {selected_timeframe} Chart (TradingView Style)",
+                    title=f"Gold Price - {timeframe_label} Chart (TradingView Style)",
                     xaxis_title="",
                     yaxis_title="Price (USD)",
                     height=600,
@@ -615,7 +617,7 @@ if df is not None:
             
             st.markdown(f"""
             **How to read this chart:**
-            - Each candle represents one {selected_timeframe.lower()} period
+            - Each candle represents one {timeframe_label.lower()} period
             - Green candles: Price closed HIGHER than it opened (bullish)
             - Red candles: Price closed LOWER than it opened (bearish)
             - The top and bottom "wicks" show the high and low prices during that period
@@ -630,41 +632,78 @@ if df is not None:
             fig = go.Figure()
             
             # Add ATR line
-            fig.add_trace(go.Scatter(
-                x=filtered_df['time'],
-                y=filtered_df['atr'],
-                mode='lines',
-                name=f'ATR ({atr_period})',
-                line=dict(color='#B388FF', width=2)  # Purple with TradingView style
-            ))
-            
-            # Add average line
-            avg_atr = filtered_df['atr'].mean()
-            fig.add_trace(go.Scatter(
-                x=filtered_df['time'],
-                y=[avg_atr] * len(filtered_df),
-                mode='lines',
-                line=dict(color='#FF6D00', width=1, dash='dash'),
-                name=f'Avg (${avg_atr:.2f})'
-            ))
-            
-            # Add smoothed ATR line
-            fig.add_trace(go.Scatter(
-                x=filtered_df['time'],
-                y=filtered_df['atr'].rolling(window=atr_period*5).mean(),
-                mode='lines',
-                line=dict(color='#26A69A', width=1),
-                name=f'Smoothed ATR'
-            ))
-            
-            # Update layout
-            fig.update_layout(
-                title=f"ATR ($) - {selected_timeframe} Chart - {atr_period} Period",
-                xaxis_title="",
-                yaxis_title="ATR (USD)",
-                height=500,
-                template="plotly_dark"  # Dark theme like TradingView
-            )
+            if show_atr_pct:
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=filtered_df['atr_pct'],
+                    mode='lines',
+                    name=f'ATR ({atr_period})',
+                    line=dict(color='#B388FF', width=2)  # Purple with TradingView style
+                ))
+                
+                # Add average line
+                avg_atr_pct = filtered_df['atr_pct'].mean()
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=[avg_atr_pct] * len(filtered_df),
+                    mode='lines',
+                    line=dict(color='#FF6D00', width=1, dash='dash'),
+                    name=f'Avg ({avg_atr_pct:.2f}%)'
+                ))
+                
+                # Add smoothed ATR line
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=filtered_df['atr_pct'].rolling(window=atr_period*5).mean(),
+                    mode='lines',
+                    line=dict(color='#26A69A', width=1),
+                    name=f'Smoothed ATR'
+                ))
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"ATR (%) - {timeframe_label} Chart - {atr_period} Period",
+                    xaxis_title="",
+                    yaxis_title="ATR (% of Price)",
+                    height=500,
+                    template="plotly_dark"  # Dark theme like TradingView
+                )
+            else:
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=filtered_df['atr'],
+                    mode='lines',
+                    name=f'ATR ({atr_period})',
+                    line=dict(color='#B388FF', width=2)  # Purple with TradingView style
+                ))
+                
+                # Add average line
+                avg_atr = filtered_df['atr'].mean()
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=[avg_atr] * len(filtered_df),
+                    mode='lines',
+                    line=dict(color='#FF6D00', width=1, dash='dash'),
+                    name=f'Avg (${avg_atr:.2f})'
+                ))
+                
+                # Add smoothed ATR line
+                fig.add_trace(go.Scatter(
+                    x=filtered_df['time'],
+                    y=filtered_df['atr'].rolling(window=atr_period*5).mean(),
+                    mode='lines',
+                    line=dict(color='#26A69A', width=1),
+                    name=f'Smoothed ATR'
+                ))
+                
+                # Update layout
+                fig.update_layout(
+                    title=f"ATR ($) - {timeframe_label} Chart - {atr_period} Period",
+                    xaxis_title="",
+                    yaxis_title="ATR (USD)",
+                    height=500,
+                    template="plotly_dark"  # Dark theme like TradingView
+                )
             
             # Add custom range selector and styling
             fig.update_layout(
@@ -751,47 +790,61 @@ if df is not None:
             """)
             
             # Calculate ATR statistics
-            avg_atr = filtered_df['atr'].mean()
-            max_atr = filtered_df['atr'].max()
+            avg_atr = filtered_df['atr'].mean() if 'atr' in filtered_df.columns and not filtered_df['atr'].isna().all() else 0
+            avg_atr_pct = filtered_df['atr_pct'].mean() if 'atr_pct' in filtered_df.columns and not filtered_df['atr_pct'].isna().all() else 0
+            max_atr = filtered_df['atr'].max() if 'atr' in filtered_df.columns and not filtered_df['atr'].isna().all() else 0
+            max_atr_pct = filtered_df['atr_pct'].max() if 'atr_pct' in filtered_df.columns and not filtered_df['atr_pct'].isna().all() else 0
             
             # Display ATR metrics
             col1, col2, col3 = st.columns(3)
             
             with col1:
-                st.metric("Average ATR", f"${avg_atr:.2f}")
+                if show_atr_pct:
+                    st.metric("Average ATR", f"{avg_atr_pct:.2f}%")
+                else:
+                    st.metric("Average ATR", f"${avg_atr:.2f}")
             
             with col2:
-                st.metric("Current ATR", f"${current_atr:.2f}")
+                if show_atr_pct:
+                    st.metric("Current ATR", f"{current_atr_pct:.2f}%")
+                else:
+                    st.metric("Current ATR", f"${current_atr:.2f}")
             
             with col3:
-                st.metric("Maximum ATR", f"${max_atr:.2f}")
+                if show_atr_pct:
+                    st.metric("Maximum ATR", f"{max_atr_pct:.2f}%")
+                else:
+                    st.metric("Maximum ATR", f"${max_atr:.2f}")
             
             # ATR Trading Applications
             st.subheader("ATR Trading Applications")
             
             # Check if ATR columns exist in the dataframe
             has_atr = 'atr' in filtered_df.columns and len(filtered_df) > 0
+            has_atr_pct = 'atr_pct' in filtered_df.columns and len(filtered_df) > 0
             
             # Calculate ATR values safely
             current_atr = filtered_df['atr'].iloc[-1] if has_atr else 0
+            current_atr_pct = filtered_df['atr_pct'].iloc[-1] if has_atr_pct else 0
             avg_atr = filtered_df['atr'].mean() if has_atr else 0 
+            avg_atr_pct = filtered_df['atr_pct'].mean() if has_atr_pct else 0
             
             # Calculate volatility comparison safely
-            if avg_atr > 0:
-                volatility_comparison = f"{(current_atr/avg_atr*100):.1f}% of normal volatility"
+            if avg_atr_pct > 0:
+                volatility_comparison = f"{(current_atr_pct/avg_atr_pct*100):.1f}% of normal volatility"
             else:
                 volatility_comparison = "N/A (insufficient data)"
             
             st.markdown(f"""
             **1. Stop Loss Placement**
-            - Tight Stop: Current Price ± {(current_atr/3):.2f} (⅓ ATR)
-            - Normal Stop: Current Price ± {(current_atr):.2f} (1 ATR)
-            - Wide Stop: Current Price ± {(current_atr*2):.2f} (2 ATR)
+            - Tight Stop: Current Price ± {(current_atr_pct/3):.2f}% (⅓ ATR)
+            - Normal Stop: Current Price ± {(current_atr_pct):.2f}% (1 ATR)
+            - Wide Stop: Current Price ± {(current_atr_pct*2):.2f}% (2 ATR)
             
             **2. Profit Targets**
-            - Conservative: Current Price ± {(current_atr):.2f} (1 ATR)
-            - Moderate: Current Price ± {(current_atr*2):.2f} (2 ATR)
-            - Aggressive: Current Price ± {(current_atr*3):.2f} (3 ATR)
+            - Conservative: Current Price ± {(current_atr_pct):.2f}% (1 ATR)
+            - Moderate: Current Price ± {(current_atr_pct*2):.2f}% (2 ATR)
+            - Aggressive: Current Price ± {(current_atr_pct*3):.2f}% (3 ATR)
             
             **3. Volatility Comparison**
             - Current vs. Average: {volatility_comparison}
@@ -801,15 +854,15 @@ if df is not None:
         st.subheader("Step 5: Performance Analysis")
         
         # Calculate period returns (depends on the timeframe)
-        if selected_timeframe in ["Daily", "Weekly", "Monthly"]:
+        if timeframe_label in ["Daily", "Weekly", "Monthly"]:
             # For these timeframes, we can do month/day of week/week of year analysis
             
             # Add seasonal analysis section based on timeframe
             st.markdown("### Seasonal Patterns Analysis")
-            st.info(f"Analyzing patterns over the last 15 years of data")
+            st.info(f"Analyzing patterns over the last {analysis_years} years of data")
             
             # Get data for the seasonal analysis based on the selected number of years
-            years_ago = pd.Timestamp.now() - pd.Timedelta(days=365 * 15)
+            years_ago = pd.Timestamp.now() - pd.Timedelta(days=365 * analysis_years)
             seasonal_df = df[df['time'] >= years_ago].copy()
             
             if len(seasonal_df) > 0:
@@ -854,7 +907,7 @@ if df is not None:
                     
                     # Update layout to match corn futures example
                     fig.update_layout(
-                        title=f"AVERAGE RETURN BY WEEK<br><sup>Gold / OPEN-CLOSE over 15 years</sup>",
+                        title=f"AVERAGE RETURN BY WEEK<br><sup>Gold / OPEN-CLOSE over {analysis_years} years</sup>",
                         xaxis_title="Week of Year",
                         yaxis_title="%",
                         height=500,
@@ -926,7 +979,7 @@ if df is not None:
                     
                     # Update layout to match corn futures example
                     fig.update_layout(
-                        title=f"AVERAGE RETURN BY MONTH<br><sup>Gold / OPEN-CLOSE over 15 years</sup>",
+                        title=f"AVERAGE RETURN BY MONTH<br><sup>Gold / OPEN-CLOSE over {analysis_years} years</sup>",
                         xaxis_title="Month",
                         yaxis_title="%",
                         height=500,
@@ -980,7 +1033,7 @@ if df is not None:
                 Higher timeframes (HTF) take precedence over lower timeframes. If the monthly trend is bullish but the daily is bearish, the monthly trend has more weight in your analysis.
                 """)
             else:
-                st.warning(f"Not enough historical data for seasonal analysis. Need at least 15 years of data.")
+                st.warning(f"Not enough historical data for seasonal analysis. Need at least {analysis_years} years of data.")
             
             # Add time period columns for original analysis
             if len(filtered_df) >= 7:  # Need at least a week of data
@@ -991,7 +1044,7 @@ if df is not None:
                 day_perf = filtered_df.groupby('day_of_week').agg({
                     'day_name': 'first',
                     'candle_color': lambda x: (x == 'green').mean() * 100,
-                    'atr': 'mean'
+                    'atr_pct': 'mean'
                 }).reset_index()
                 
                 day_perf = day_perf.sort_values('day_of_week')
@@ -1038,9 +1091,9 @@ if df is not None:
                     # Add bars for day of week ATR
                     fig.add_trace(go.Bar(
                         x=day_perf['day_name'],
-                        y=day_perf['atr'],
+                        y=day_perf['atr_pct'],
                         marker_color='purple',
-                        text=day_perf['atr'].apply(lambda x: f"{x:.2f}"),
+                        text=day_perf['atr_pct'].apply(lambda x: f"{x:.2f}%"),
                         textposition='auto'
                     ))
                     
@@ -1048,7 +1101,7 @@ if df is not None:
                     fig.update_layout(
                         title=f"Average ATR by Day of Week",
                         xaxis_title="Day of Week",
-                        yaxis_title="ATR (USD)",
+                        yaxis_title="ATR (% of Price)",
                         height=400,
                         template="plotly_white"
                     )
@@ -1063,7 +1116,7 @@ if df is not None:
                     - This can help you identify which days typically have the most price movement
                     """)
             
-            if selected_timeframe in ["Daily", "Weekly"] and len(filtered_df) >= 30:
+            if timeframe_label in ["Daily", "Weekly"] and len(filtered_df) >= 30:
                 # Month analysis
                 filtered_df['month'] = filtered_df['time'].dt.month
                 filtered_df['month_name'] = filtered_df['time'].dt.strftime('%b')
@@ -1071,7 +1124,7 @@ if df is not None:
                 month_perf = filtered_df.groupby('month').agg({
                     'month_name': 'first',
                     'candle_color': lambda x: (x == 'green').mean() * 100,
-                    'atr': 'mean'
+                    'atr_pct': 'mean'
                 }).reset_index()
                 
                 month_perf = month_perf.sort_values('month')
@@ -1123,9 +1176,9 @@ if df is not None:
                     # Add bars for monthly ATR
                     fig.add_trace(go.Bar(
                         x=month_perf['month_name'],
-                        y=month_perf['atr'],
+                        y=month_perf['atr_pct'],
                         marker_color='purple',
-                        text=month_perf['atr'].apply(lambda x: f"{x:.2f}"),
+                        text=month_perf['atr_pct'].apply(lambda x: f"{x:.2f}%"),
                         textposition='auto'
                     ))
                     
@@ -1133,7 +1186,7 @@ if df is not None:
                     fig.update_layout(
                         title=f"Average ATR by Month",
                         xaxis_title="Month",
-                        yaxis_title="ATR (USD)",
+                        yaxis_title="ATR (% of Price)",
                         height=400,
                         template="plotly_white",
                         xaxis=dict(
@@ -1238,8 +1291,8 @@ st.sidebar.markdown("""
 st.sidebar.info("The calculations are based on the open and close prices from each specific timeframe file.") 
 
 # Display BARCODE classification if enabled
-if True:
-    with st.expander(" BARCODE Classification System"):
+if show_barcode:
+    with st.expander("🔍 BARCODE Classification System"):
         st.markdown("""
         ## BARCODE Classification System
         
@@ -1247,7 +1300,7 @@ if True:
         1. **Decennial (0-9)**: Position in decade (0=year ending in 0, 9=year ending in 9)
         2. **Presidential (1-4)**: Year in presidential term (1=first year, 4=fourth year)
         3. **Quarter (1-4)**: Quarter of year (1=Q1, 4=Q4)
-        4. **Month (1-12)**: Month of the year (1=Jan, 12=Dec)
+        4. **Month (1-12)**: Month of year (1=Jan, 12=Dec)
         5. **Week (1-5)**: Week of month (1=first week, 5=fifth week if exists)
         6. **Day (1-7)**: Day of week (1=Monday, 7=Sunday)
         7. **Session (1-3)**: Trading session (1=Asian, 2=European, 3=American)
@@ -1264,8 +1317,8 @@ if True:
         st.dataframe(barcode_sample.head(10))
 
 # Add new BARCODE profile visualization section after the Step 5: Performance Analysis section
-if True and len(filtered_df) > 0:
-    st.header(" BARCODE Sequential Profile Analysis")
+if show_barcode and len(filtered_df) > 0:
+    st.header("BARCODE Sequential Profile Analysis")
     st.markdown("""
     This analysis examines market patterns across different time cycles using the BARCODE classification system.
     Each level provides insights into how gold performs during specific time periods.
@@ -1889,7 +1942,7 @@ if True and len(filtered_df) > 0:
                 st.info("No intraday time data available for this timeframe selection.")
 
 # Add combined BARCODE profile table
-st.header(" BARCODE Profile Table")
+st.header("🔍 BARCODE Profile Table")
 st.markdown("""
 This table shows the complete BARCODE classification for the selected time period.
 You can use it to identify specific patterns or filter data for further analysis.
@@ -1973,14 +2026,14 @@ if len(filtered_df) > 0:
         st.download_button(
             label="Download CSV",
             data=csv,
-            file_name=f"gold_barcode_profile_{selected_timeframe.lower().replace(' ', '_')}.csv",
+            file_name=f"gold_barcode_profile_{timeframe_label.lower().replace(' ', '_')}.csv",
             mime="text/csv"
         )
 else:
     st.warning("No data available to display BARCODE profile table.")
 
 # Add ATR Points System explanation
-if 'atr_points' in filtered_df.columns:
+if 'atr_points' in filtered_df.columns and atr_ratio_enabled:
     st.header("ATR Points System (1-2-3 Scale)")
     st.markdown("""
     The ATR Points System classifies volatility into three categories:
@@ -2128,7 +2181,7 @@ if 'atr_points' in filtered_df.columns:
         st.dataframe(transitions_display)
 
 # Add ATR explanation
-with st.expander(" Understand ATR (Average True Range) Analysis"):
+with st.expander("💹 Understand ATR (Average True Range) Analysis"):
     # Check if ATR columns exist in the dataframe
     has_atr = 'atr' in filtered_df.columns and len(filtered_df) > 0
     has_atr_pct = 'atr_pct' in filtered_df.columns and len(filtered_df) > 0
@@ -2151,7 +2204,7 @@ with st.expander(" Understand ATR (Average True Range) Analysis"):
     ATR measures market volatility by calculating the average range between high and low prices.
     Higher ATR = Higher volatility = Wider price swings
     
-    **Current ATR Analysis for {selected_timeframe} Data:**
+    **Current ATR Analysis for {timeframe_label} Data:**
     
     **1. Raw Values**
     - Current ATR: {current_atr:.2f} price units
@@ -2166,69 +2219,3 @@ with st.expander(" Understand ATR (Average True Range) Analysis"):
     **3. Volatility Comparison**
     - Current vs. Average: {volatility_comparison if avg_atr_pct > 0 else "N/A (insufficient data)"}
     """)
-
-# New function to add the 7-level BARCODE classification system
-def add_barcode_classification(df):
-    """
-    Adds the 7-level BARCODE classification system to the dataframe:
-    1. Decennial (0-9): Which year in the decade
-    2. Presidential (1-4): Year in the presidential term
-    3. Quarter (1-4): Quarter of the year
-    4. Month (1-12): Month of the year
-    5. Week (1-4/5): Week of the month
-    6. Day (1-5): Day of the week
-    7. Session (1-3): Trading session of the day
-    """
-    # Create a copy to avoid warnings
-    df_result = df.copy()
-    
-    # 1. Decennial classification (0-9)
-    df_result['year'] = df_result['time'].dt.year
-    df_result['decade'] = (df_result['year'] // 10) * 10
-    df_result['decennial'] = df_result['year'] % 10
-    
-    # 2. Presidential classification (1-4)
-    # Starting with 1789 as the first presidential year
-    # Presidential cycles start in year after election (traditionally)
-    df_result['presidential'] = ((df_result['year'] - 1789) % 4) + 1
-    
-    # 3. Quarter classification (1-4)
-    df_result['quarter'] = df_result['time'].dt.quarter
-    
-    # 4. Month classification (1-12)
-    df_result['month'] = df_result['time'].dt.month
-    df_result['month_name'] = df_result['time'].dt.strftime('%b')
-    
-    # 5. Week classification (1-5)
-    # We'll use ISO week of the month (1st week, 2nd week, etc.)
-    df_result['week_of_month'] = ((df_result['time'].dt.day - 1) // 7) + 1
-    df_result['week_of_year'] = df_result['time'].dt.isocalendar().week
-    
-    # 6. Day classification (1-7, where 1=Monday in ISO format)
-    df_result['day_of_week'] = df_result['time'].dt.dayofweek + 1  # Make Monday=1
-    df_result['day_name'] = df_result['time'].dt.strftime('%a')
-    
-    # 7. Session classification (1-3)
-    # Assign trading sessions based on hour
-    # 1: Asian (0-8 UTC)
-    # 2: European (8-16 UTC)
-    # 3: American (16-24 UTC)
-    hour_conditions = [
-        (df_result['time'].dt.hour >= 0) & (df_result['time'].dt.hour < 8),
-        (df_result['time'].dt.hour >= 8) & (df_result['time'].dt.hour < 16),
-        (df_result['time'].dt.hour >= 16) & (df_result['time'].dt.hour < 24)
-    ]
-    session_values = [1, 2, 3]
-    session_names = ['Asian', 'European', 'American']
-    
-    # Only add session data if we have hour information
-    if len(df_result) > 0 and hasattr(df_result['time'].iloc[0], 'hour'):
-        df_result['session'] = np.select(hour_conditions, session_values, default=0)
-        df_result['session_name'] = np.select(hour_conditions, session_names, default='Unknown')
-    
-    # Add candle color classification
-    # Calculate candle color (green = bullish, red = bearish)
-    df_result['candle_color'] = np.where(df_result['Close'] >= df_result['Open'], 'green', 'red')
-    
-    # Return the improved classified dataframe
-    return df_result
